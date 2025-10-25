@@ -1,120 +1,199 @@
-import { useState } from "react";
-import { Table, Button, Space, Select, Typography, message } from "antd";
+import { useEffect, useMemo, useState } from "react";
+import { Typography, Select, Button, Table, DatePicker, TimePicker, Space, message, Modal, Form, Input } from "antd";
 import dayjs from "dayjs";
-// import axios from "axios"; // <- descomenta cuando conectes backend
-
-const { Title, Text } = Typography;
-
-const empleadosMock = [
-    { id_empleado: 1, nombre: "Gian Franco Medina" },
-    { id_empleado: 2, nombre: "Sebastián Cáceres" },
-    { id_empleado: 3, nombre: "María López" },
-];
+import { listMarcaciones, createMarcacion, actualizarSalida, findMarcacionAbierta } from "../api/marcaciones";
+import { listEmpleados } from "../api/empleados";
+import { listHorarios } from "../api/horarios";
 
 export default function MarcacionesPage() {
-    const [empleadoId, setEmpleadoId] = useState(1);
-    const [marcaciones, setMarcaciones] = useState([
-        {
-            id_marcacion: 1,
-            id_empleado: 1,
-            empleado: "Gian Franco Medina",
-            fecha_marcacion: dayjs().format("YYYY-MM-DD"),
-            hora_entrada: "08:05",
-            hora_salida: "17:00",
-            observacion: "Normal",
-        },
-    ]);
+    const [rows, setRows] = useState([]);
+    const [empleados, setEmpleados] = useState([]);
+    const [horarios, setHorarios] = useState([]);
+    const [idEmpleado, setIdEmpleado] = useState(null);
 
-    const empleadoSel = empleadosMock.find(e => e.id_empleado === empleadoId);
+    const [desde, setDesde] = useState(dayjs().startOf("day"));
+    const [hasta, setHasta] = useState(dayjs().endOf("day"));
+
+    // Modal para registrar entrada/salida manualmente
+    const [open, setOpen] = useState(false);
+    const [tipo, setTipo] = useState("entrada");
+    const [form] = Form.useForm();
+
+    const fechaISO = useMemo(() => (form.getFieldValue("fecha") || dayjs()).format("YYYY-MM-DD"), [form]);
+
+    const fetchAll = async () => {
+        try {
+            const [e, h] = await Promise.all([listEmpleados(), listHorarios()]);
+            setEmpleados(e.data || []);
+            setHorarios(h.data || []);
+        } catch {
+            message.error("No se pudieron cargar catálogos");
+        }
+        await fetchMarcaciones();
+    };
+
+    const fetchMarcaciones = async () => {
+        if (!desde || !hasta) return;
+        try {
+            const res = await listMarcaciones({
+                desde: desde.format("YYYY-MM-DD"),
+                hasta: hasta.format("YYYY-MM-DD"),
+                id_empleado: idEmpleado || undefined,
+            });
+            setRows(res.data || []);
+        } catch {
+            message.error("No se pudieron cargar marcaciones");
+        }
+    };
+
+    useEffect(() => { fetchAll(); }, []);
+    useEffect(() => { fetchMarcaciones(); /* cada vez que cambien filtros */ }, [desde, hasta, idEmpleado]);
 
     const columns = [
-        { title: "Empleado", dataIndex: "empleado" },
-        {
-            title: "Fecha", dataIndex: "fecha_marcacion",
-            render: (f) => dayjs(f).format("DD/MM/YYYY")
-        },
+        { title: "Empleado", dataIndex: "empleado", render: (_, r) => r.empleado_nombre || `${r.nombres ?? ""} ${r.apellidos ?? ""}` },
+        { title: "Fecha", dataIndex: "fecha_marcacion", render: v => v ? dayjs(v).format("DD/MM/YYYY") : "—" },
         { title: "Hora Entrada", dataIndex: "hora_entrada" },
         { title: "Hora Salida", dataIndex: "hora_salida" },
         { title: "Observación", dataIndex: "observacion" },
     ];
 
-    const marcarEntrada = async () => {
-        const hoy = dayjs().format("YYYY-MM-DD");
-        const hora = dayjs().format("HH:mm");
-
-        // Si ya tiene entrada hoy, no repetir
-        const yaHay = marcaciones.find(
-            m => m.id_empleado === empleadoId && m.fecha_marcacion === hoy && m.hora_entrada
-        );
-        if (yaHay) {
-            message.warning("Ya registraste la entrada hoy.");
+    const openModal = (t) => {
+        if (!idEmpleado) {
+            message.warning("Selecciona un empleado");
             return;
         }
-
-        const nuevo = {
-            id_marcacion: Date.now(),
-            id_empleado: empleadoId,
-            empleado: empleadoSel?.nombre || "",
-            fecha_marcacion: hoy,
-            hora_entrada: hora,
-            hora_salida: null,
-            observacion: "Entrada registrada",
-        };
-
-        // Ejemplo con backend:
-        // const { data } = await axios.post("/api/marcaciones/entrada", { id_empleado: empleadoId });
-
-        setMarcaciones(prev => [nuevo, ...prev]);
-        message.success("Entrada registrada");
+        setTipo(t);
+        setOpen(true);
+        form.resetFields();
+        form.setFieldsValue({
+            id_empleado: idEmpleado,
+            id_horario: undefined,
+            fecha: dayjs(),
+            hora: dayjs(),
+            observacion: undefined,
+        });
     };
 
-    const marcarSalida = async () => {
-        const hoy = dayjs().format("YYYY-MM-DD");
-        const hora = dayjs().format("HH:mm");
+    const onSubmit = async () => {
+        try {
+            const vals = await form.validateFields();
+            const fecha = vals.fecha.format("YYYY-MM-DD");
+            const hora = vals.hora.format("HH:mm:ss");
 
-        const idx = marcaciones.findIndex(
-            m => m.id_empleado === empleadoId && m.fecha_marcacion === hoy
-        );
-        if (idx === -1) {
-            message.warning("No existe entrada hoy para este empleado.");
-            return;
+            if (tipo === "entrada") {
+                // Crear marcación con hora_entrada
+                await createMarcacion({
+                    id_empleado: vals.id_empleado,
+                    id_horario: vals.id_horario || null,
+                    fecha_marcacion: fecha,
+                    hora_entrada: hora,
+                    observacion: vals.observacion || null,
+                });
+                message.success("Entrada registrada");
+            } else {
+                // Cerrar la marcación abierta (misma fecha, salida null)
+                const abierta = findMarcacionAbierta(rows, vals.id_empleado, fecha);
+                if (!abierta) {
+                    message.error("No hay marcación de entrada abierta para esta fecha");
+                    return;
+                }
+                await actualizarSalida(abierta.id_marcacion, {
+                    hora_salida: hora,
+                    observacion: vals.observacion || null,
+                });
+                message.success("Salida registrada");
+            }
+
+            setOpen(false);
+            fetchMarcaciones();
+        } catch (e) {
+            if (!e?.errorFields) message.error("No se pudo guardar la marcación");
         }
-
-        const copia = [...marcaciones];
-        copia[idx] = { ...copia[idx], hora_salida: hora, observacion: "Salida registrada" };
-
-        // Ejemplo con backend:
-        // await axios.post("/api/marcaciones/salida", { id_empleado: empleadoId });
-
-        setMarcaciones(copia);
-        message.success("Salida registrada");
     };
 
     return (
-        <div>
-            <Title level={3} style={{ marginBottom: 8 }}>Marcaciones</Title>
-            <Text type="secondary">
-                Selecciona un empleado y registra su entrada/salida (modo demo en memoria).
-            </Text>
+        <div className="page">
+            <div className="page-header">
+                <Typography.Title level={2}>Marcaciones</Typography.Title>
+                <Typography.Paragraph className="page-subtitle">
+                    Filtra por rango de fechas (requerido por la API) y usa las acciones para registrar entradas/salidas.
+                </Typography.Paragraph>
+            </div>
 
-            <Space style={{ margin: "16px 0" }} wrap>
+            <div className="page-toolbar">
                 <Select
                     style={{ minWidth: 260 }}
-                    value={empleadoId}
-                    onChange={setEmpleadoId}
-                    options={empleadosMock.map(e => ({ value: e.id_empleado, label: e.nombre }))}
+                    placeholder="Selecciona empleado (opcional)"
+                    allowClear
+                    value={idEmpleado ?? undefined}
+                    onChange={setIdEmpleado}
+                    options={(empleados || []).map(e => ({
+                        value: e.id_empleado,
+                        label: `${e.nombres} ${e.apellidos}`,
+                    }))}
                 />
-                <Button type="primary" onClick={marcarEntrada}>Marcar entrada</Button>
-                <Button onClick={marcarSalida}>Marcar salida</Button>
-                <Button onClick={() => window.location.reload()}>Refrescar</Button>
-            </Space>
+                <DatePicker value={desde} onChange={setDesde} allowClear={false} />
+                <DatePicker value={hasta} onChange={setHasta} allowClear={false} />
+                <Space>
+                    <Button onClick={fetchMarcaciones}>Consultar</Button>
+                    <Button type="primary" onClick={() => openModal("entrada")}>Marcar entrada</Button>
+                    <Button onClick={() => openModal("salida")}>Marcar salida</Button>
+                </Space>
+            </div>
 
-            <Table
-                dataSource={marcaciones}
-                columns={columns}
-                rowKey="id_marcacion"
-                pagination={{ pageSize: 8 }}
-            />
+            <div className="page-card">
+                <Table
+                    dataSource={rows}
+                    columns={columns}
+                    rowKey={(r, i) => r.id_marcacion ?? i}
+                />
+            </div>
+
+            <Modal
+                open={open}
+                onCancel={() => setOpen(false)}
+                onOk={onSubmit}
+                okText="Guardar"
+                title={tipo === "entrada" ? "Registrar entrada" : "Registrar salida"}
+                destroyOnClose
+            >
+                <Form layout="vertical" form={form}>
+                    <Form.Item name="id_empleado" label="Empleado" rules={[{ required: true }]}>
+                        <Select
+                            showSearch
+                            optionFilterProp="label"
+                            options={(empleados || []).map(e => ({
+                                value: e.id_empleado,
+                                label: `${e.nombres} ${e.apellidos}`,
+                            }))}
+                        />
+                    </Form.Item>
+
+                    <Form.Item name="id_horario" label="Horario (opcional)">
+                        <Select
+                            allowClear
+                            placeholder="Selecciona horario"
+                            options={(horarios || []).map(h => ({
+                                value: h.id_horario,
+                                label: `${h.descripcion} (${h.hora_entrada} - ${h.hora_salida})`,
+                            }))}
+                            disabled={tipo === "salida"}
+                        />
+                    </Form.Item>
+
+                    <Form.Item name="fecha" label="Fecha" rules={[{ required: true }]}>
+                        <DatePicker style={{ width: "100%" }} />
+                    </Form.Item>
+
+                    <Form.Item name="hora" label="Hora" rules={[{ required: true }]}>
+                        <TimePicker format="HH:mm" style={{ width: "100%" }} />
+                    </Form.Item>
+
+                    <Form.Item name="observacion" label="Observación">
+                        <Input.TextArea rows={2} maxLength={200} />
+                    </Form.Item>
+                </Form>
+            </Modal>
         </div>
     );
 }
